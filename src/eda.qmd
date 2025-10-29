@@ -1,0 +1,386 @@
+---
+title: "eda"
+format: html
+---
+
+## Loading Dataset
+
+```{r}
+# Replace with your file paths; OR-II has two periods/files
+# Example filenames are indicative; check the actual filenames you downloaded
+dt <- fread("../input/online_retail_II.csv")
+summary(dt)
+
+# Verifying the column names
+names(dt)
+
+# Changing the column names for better readility and understandability
+names(dt)[names(dt) == "Customer ID"] <- "CustomerID"
+names(dt)[names(dt) == "Invoice"] <- "InvoiceNo"
+names(dt)[names(dt) == "Price"] <- "UnitPrice"
+
+# Re-verifying the column names after change
+names(dt)
+
+# Basic type casting
+dt[, InvoiceDate := as.POSIXct(InvoiceDate, tz = "UTC")]
+dt[, CustomerID  := as.character(CustomerID)]
+dt[, StockCode   := as.character(StockCode)]
+dt[, Description := as.character(Description)]
+dt[, Country     := as.character(Country)]
+
+```
+
+## Cleaning the Data
+
+Exclude cancellations, missing customer IDs, and non‑positive quantities/prices to avoid label leakage and noise, per the dataset’s conventions.
+
+```{r}
+n0 <- nrow(dt)
+dt <- dt[!grepl("^C", InvoiceNo)]                     # drop cancellations
+n1 <- nrow(dt)
+cat("\nDropped ",n0-n1," Rows (Cancellations)")
+
+dt <- dt[!is.na(CustomerID)]                          # drop missing customers
+n2 <- nrow(dt)
+cat("\nDropped ",n1-n2," Rows (Missing Customers)")
+
+dt <- dt[Quantity > 0 & UnitPrice > 0]                # enforce positive values
+n3 <- nrow(dt)
+cat("\nDropped ",n2-n3," Rows (Enforcing positive values on UnitPrice & Quantity)")
+
+message(sprintf("\nTotal Dropped %d rows (%.2f%%)", n0 - n3, 100*(n0-n1)/n0))
+message(sprintf("\nRemaining %d rows", n3))
+```
+
+```{r}
+summary(dt)
+```
+
+```{r}
+summary_stats <- list(
+  n_txn  = nrow(dt),
+  n_cust = uniqueN(dt$CustomerID),
+  n_item = uniqueN(dt$StockCode),
+  start  = min(dt$InvoiceDate),
+  end    = max(dt$InvoiceDate)
+)
+
+cat("\nNo. of transactions :",summary_stats$n_txn)
+cat("\nNo. of unique customers :",summary_stats$n_cust)
+cat("\nNo. of unique items :",summary_stats$n_item)
+cat("\nTransaction start date :")
+summary_stats$start
+cat("\nTransaction end date : ")
+summary_stats$end
+
+```
+
+## Temporal split (prevent leakage)
+
+```{r}
+# Define cutoff (adjust as needed based on your EDA)
+cutoff <- as.POSIXct("2011-01-01 00:00:00", tz = "UTC")
+
+# Identify each item's first appearance
+item_first <- dt[, .(first_date = min(InvoiceDate)), by = StockCode]
+
+# Split items by first appearance relative to cutoff
+items_train <- item_first[first_date < cutoff, StockCode]
+items_test  <- item_first[first_date >= cutoff, StockCode]
+
+dt_train <- dt[StockCode %in% items_train & InvoiceDate < cutoff]
+dt_test  <- dt[StockCode %in% items_test  & InvoiceDate >= cutoff]
+
+cat("\nNo of rows in train: ", nrow(dt_train))
+cat("\nNo of rows in test: ",nrow(dt_test))
+
+```
+
+## RFM
+
+```{r}
+# RFM window (e.g., last 180 days before cutoff)
+rfm_start <- cutoff - 180*24*3600
+hist_win  <- dt_train[InvoiceDate >= rfm_start]
+
+cust_last_date <- hist_win[, .(last_date = max(InvoiceDate)), by = CustomerID]
+cust_freq      <- hist_win[, .(freq = uniqueN(InvoiceNo)),    by = CustomerID]
+cust_monetary  <- hist_win[, .(monetary = sum(Quantity*UnitPrice)), by = CustomerID]
+
+rfm <- merge(cust_last_date, cust_freq, by="CustomerID", all=TRUE)
+rfm <- merge(rfm, cust_monetary, by="CustomerID", all=TRUE)
+rfm[, recency_days := as.numeric(difftime(cutoff, last_date, units="days"))]
+rfm[is.na(freq), freq := 0L]
+rfm[is.na(monetary), monetary := 0]
+rfm[, last_date := NULL]
+```
+
+```{r}
+cat("RFM Table:")
+head(rfm)
+
+cat("\nRFM Table Summary:")
+summary(rfm)
+```
+
+## Item TF‑IDF (cold‑start content)
+
+For new items with no interactions, represent Description as text features to match customers to similar items they previously purchased.​
+
+```{r}
+# Unique item descriptions in train
+items_desc_train <- dt_train[!is.na(Description),
+                             .(Description = Description[which.max(Quantity)]),  # pick a stable desc
+                             by = StockCode]
+
+# Tokenization & TF-IDF on train items only
+prep_fun <- tolower
+tok_fun  <- word_tokenizer
+
+it_train <- itoken(prep_fun(items_desc_train$Description),
+                   tokenizer = tok_fun,
+                   progressbar = FALSE)
+
+vocab <- create_vocabulary(it_train)
+vocab <- prune_vocabulary(vocab, term_count_min = 5)  # prune rare terms
+vectorizer <- vocab_vectorizer(vocab)
+
+dtm_train <- create_dtm(it_train, vectorizer)
+tfidf     <- TfIdf$new()
+dtm_train_tfidf <- tfidf$fit_transform(dtm_train)  # fit on train
+
+# Prepare test item TF-IDF using the same vectorizer+transform
+items_desc_test <- dt_test[!is.na(Description),
+                           .(Description = Description[which.max(Quantity)]),
+                           by = StockCode]
+it_test <- itoken(prep_fun(items_desc_test$Description),
+                  tokenizer = tok_fun,
+                  progressbar = FALSE)
+dtm_test <- create_dtm(it_test, vectorizer)
+dtm_test_tfidf <- tfidf$transform(dtm_test)
+```
+
+## Customer text profiles (historical tastes)
+
+Aggregate past purchased item vectors into a per‑customer profile to capture tastes for matching to new item content.​
+
+Result: A sparse matrix of customer profiles in the same TF‑IDF space as items, suitable for cosine similarity.
+
+```{r}
+# Map StockCode to row index in dtm_train_tfidf
+item_index <- data.table(StockCode = items_desc_train$StockCode,
+                         row_id = seq_len(nrow(items_desc_train)))
+setkey(item_index, StockCode)
+
+# Customer -> items purchased (train period)
+cust_item <- unique(dt_train[, .(CustomerID, StockCode)])
+cust_item <- cust_item[StockCode %in% item_index$StockCode]
+cust_item <- item_index[cust_item, on="StockCode"]  # adds row_id
+
+# Build a sparse incidence matrix (customers x items)
+cust_ids <- unique(cust_item$CustomerID)
+cust_map <- data.table(CustomerID = cust_ids, cid = seq_along(cust_ids))
+setkey(cust_map, CustomerID)
+cust_item <- cust_map[cust_item, on="CustomerID"]
+
+X_ci <- sparseMatrix(
+  i = cust_item$cid,
+  j = cust_item$row_id,
+  x = 1,
+  dims = c(nrow(cust_map), nrow(items_desc_train))
+)
+
+# Customer text profiles: weighted sum of item TF-IDF rows
+# (Normalize rows to unit length to make cosine similarity straightforward)
+cust_profiles <- X_ci %*% dtm_train_tfidf
+row_norms <- sqrt(rowSums(cust_profiles^2))
+row_norms[row_norms == 0] <- 1
+cust_profiles <- Diagonal(x = 1/row_norms) %*% cust_profiles
+```
+
+## Similarity feature for cold‑start scoring
+
+Cosine similarity between a new item’s TF‑IDF vector and a customer’s profile is an intuitive, interpretable signal for interest at launch.
+
+A function to compute top‑N customers by similarity for any test item; later, you’ll enrich with RFM and model these signals with mlr3.
+
+```{r}
+# Utility: cosine similarity between a single item vector and all customers
+cosine_topN <- function(item_vec, cust_profiles, cust_map, N = 100) {
+  # item_vec is 1 x T sparse; ensure unit-length
+  denom <- sqrt(sum(item_vec^2))
+  if (denom == 0) denom <- 1
+  item_unit <- item_vec / denom
+  scores <- as.numeric(cust_profiles %*% t(item_unit)) # (C x T) * (T x 1)
+  ord <- order(scores, decreasing = TRUE)
+  top_idx <- head(ord, N)
+  data.table(CustomerID = cust_map$CustomerID[top_idx],
+             sim = scores[top_idx])
+}
+```
+
+```{r}
+# Example: score the first test item
+test_item_vec <- dtm_test_tfidf[1, , drop = FALSE]
+topN_sim <- cosine_topN(test_item_vec, cust_profiles, cust_map, N = 100)
+head(topN_sim)
+```
+
+## Build supervised training pairs (labels without leakage)
+
+Train a propensity model that combines RFM and similarity features, labeling customers who actually bought each “new” item after its first appearance.​
+
+Result: A training table of (customer, item) pairs with features at launch time and labels from a post‑launch horizon.
+
+```{r}
+# Define a post-launch window for positives (e.g., 30 days)
+pos_window_days <- 30
+
+# For each test item, determine its launch date
+launch_test <- item_first[StockCode %in% items_test]
+setkey(launch_test, StockCode)
+
+# Build candidate pairs: for brevity, use customers with any train history
+candidates <- CJ(StockCode = items_desc_test$StockCode, CustomerID = cust_map$CustomerID, unique = TRUE)
+
+# Join launch dates and derive labels: did customer buy item within 30 days after launch?
+cand_lab <- merge(candidates, launch_test, by = "StockCode", all.x = TRUE)
+cand_lab <- merge(cand_lab, dt[, .(bought = 1L, InvoiceDate, CustomerID, StockCode)], by = c("CustomerID","StockCode"), all.x = TRUE)
+cand_lab[, label := as.integer(!is.na(bought) & InvoiceDate >= first_date & InvoiceDate <= first_date + pos_window_days*24*3600)]
+cand_lab[, c("bought","InvoiceDate") := NULL]
+
+# Attach features: RFM and cosine similarity at launch
+# Map CustomerID to rfm
+setkey(rfm, CustomerID)
+cand_lab <- rfm[cand_lab, on="CustomerID"]
+
+# Compute cosine similarity per (customer,item)
+# Build a named list of item vectors for fast lookup
+test_rows <- data.table(StockCode = items_desc_test$StockCode, row_id = seq_len(nrow(items_desc_test)))
+setkey(test_rows, StockCode)
+
+get_item_vec <- function(sc){
+  rid <- test_rows[sc, row_id]
+  if (is.na(rid)) return(NULL)
+  dtm_test_tfidf[rid, , drop = FALSE]
+}
+```
+
+```{r}
+# Normalize test item TF-IDF rows once
+item_norms <- sqrt(rowSums(dtm_test_tfidf^2))
+item_norms[item_norms == 0] <- 1
+dtm_test_unit <- Diagonal(x = 1 / item_norms) %*% dtm_test_tfidf  # unit-length items [web:29]
+
+# Compute similarities in chunks of items to control memory
+chunk_size <- 100L
+n_items <- nrow(dtm_test_unit)
+idx_chunks <- split(seq_len(n_items), ceiling(seq_len(n_items) / chunk_size))
+
+sim_chunks <- lapply(idx_chunks, function(idxs) {
+  S <- cust_profiles %*% t(dtm_test_unit[idxs, , drop = FALSE])  # C x |chunk| [web:29]
+  data.table(
+    cid = rep(seq_len(nrow(cust_profiles)), times = length(idxs)),
+    col = rep(idxs, each = nrow(cust_profiles)),
+    sim = as.numeric(S)
+  )
+})
+
+sim_dt <- rbindlist(sim_chunks)
+# Map matrix column -> StockCode
+sim_dt[, StockCode := items_desc_test$StockCode[col]]
+# Map cid -> CustomerID
+sim_dt[, CustomerID := cust_map$CustomerID[cid]]
+sim_dt <- sim_dt[, .(CustomerID, StockCode, sim)]
+
+# Ensure candidate pairs are unique before join
+cand_lab <- cand_lab[
+  , .(label = as.integer(any(label == 1L)), first_date = first(first_date)),
+  by = .(CustomerID, StockCode)
+]  # dedupe per pair [web:115]
+
+# Join similarities to candidates
+setkey(sim_dt, CustomerID, StockCode)
+setkey(cand_lab, CustomerID, StockCode)
+cand_lab <- sim_dt[cand_lab]  # adds sim, preserves candidate rows [web:100]
+```
+
+## Train an mlr3 baseline
+
+Start with a simple, interpretable model (e.g., logistic regression) and add a stronger tree ensemble (xgboost) once features stabilize.
+
+An mlr3 TaskClassif with train/validation split, a baseline learner, and predictions to rank customers for each test item
+
+```{r}
+# adds RFM features
+cand_lab <- merge(cand_lab, rfm, by = "CustomerID", all.x = TRUE)
+# Minimal feature table (drop NAs)
+train_dt <- na.omit(cand_lab[, .(label, recency_days, freq, monetary, sim)])
+train_dt[, label := factor(label, levels = c(0,1), labels = c("no","yes"))]
+
+task <- TaskClassif$new("nbo", backend = train_dt, target = "label", positive = "yes")
+
+# Baseline: logistic regression
+learner_lr <- lrn("classif.log_reg")
+rr <- resample(task, learner = learner_lr, rsmp("holdout"))
+preds <- rr$prediction()
+
+# Optional: xgboost via mlr3
+learner_xgb <- lrn("classif.xgboost", objective = "binary:logistic", eval_metric = "auc")
+rr_xgb <- resample(task, learner = learner_xgb, rsmp("holdout"))
+```
+
+## Evaluate ranking (precision\@k)
+
+Operations consume a fixed‑size top‑N customer list per new item, so precision\@k and recall\@k are the business‑relevant metrics, with ROC‑AUC as a secondary diagnostic.
+
+Precision\@k/recall\@k computed per item and then averaged, reflecting campaign capacity and sales bandwidth.
+
+```{r}
+# Assuming preds is over a heldout set that includes (customer,item,label)
+# If preds lacks item IDs, rebuild evaluation on cand_lab with model scores.
+# Here is a simple precision@k calculator by item:
+
+precision_at_k <- function(scores_dt, k = 50) {
+  # scores_dt: columns StockCode, CustomerID, score, label (0/1)
+  pk <- scores_dt[order(-score), .(p_at_k = {
+    topk <- head(.SD, k)
+    if (nrow(topk) == 0) return(NA_real_)
+    sum(topk$label == 1) / nrow(topk)
+  }), by = StockCode]
+  mean(pk$p_at_k, na.rm = TRUE)
+}
+
+# Example: use cosine similarity alone as score
+scores_dt <- copy(cand_lab)
+scores_dt[, score := fifelse(is.na(sim), 0, sim)]
+scores_dt[, label := as.integer(label)]  # ensure 0/1
+
+p_at_50 <- precision_at_k(scores_dt, k = 50)
+p_at_50
+```
+
+## Produce a top‑N list for a brand‑new item
+
+Demonstrate end‑to‑end utility by generating the customer list the business will actually action at SKU launch.​
+
+Result: A ranked table of customers with scores (similarity or model probability) ready for CRM or sales export.
+
+```{r}
+rank_customers_for_item <- function(stockcode, N = 200, use_similarity = TRUE) {
+  iv <- get_item_vec(stockcode)
+  if (is.null(iv)) stop("Item not in test vocabulary.")
+  if (use_similarity) {
+    res <- cosine_topN(iv, cust_profiles, cust_map, N)
+    setorder(res, -sim)
+    res
+  } else {
+    # Placeholder: if you have a trained mlr3 model, generate features and predict proba here
+    stop("Hook up mlr3 learner predict_proba for model-based ranking.")
+  }
+}
+
+topN_for_first_test <- rank_customers_for_item(items_desc_test$StockCode[1], N = 200)
+head(topN_for_first_test)
+```

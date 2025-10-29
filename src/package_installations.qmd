@@ -1,0 +1,17 @@
+---
+title: "package_installations"
+format: html
+---
+
+```{r}
+install.packages(c("data.table","text2vec","mlr3","mlr3pipelines","xgboost","Matrix","stringi","recommenderlab","mlr3learners"))
+library(data.table)
+library(text2vec)
+library(mlr3)
+library(mlr3pipelines)
+library(xgboost)
+library(Matrix)
+library(stringi)
+library(recommenderlab)
+library(mlr3learners)
+```
